@@ -1,6 +1,14 @@
 """
-SE431 - Phase 2 - MR-02
+SE431 - Phase 3 - Refactoring
 Repository layer: abstracts DB access. Interchangeable implementations.
+
+Changes from Phase 2:
+  R3  find_member / find_book / find_active_loan now return model objects
+      (Member, Book, Loan) instead of plain dicts.
+  R5  borrow_copy(member_id, book_id) and return_copy(member_id, book_id)
+      perform both DB writes inside a single atomic transaction; a failure
+      in either write triggers an automatic rollback so the DB is never
+      left in a half-updated state.
 
 IMPORTANT:
 - setup_schema() creates tables ONLY (no data).
@@ -9,7 +17,7 @@ IMPORTANT:
 """
 
 from abc import ABC, abstractmethod
-
+from models import Member, Book, Loan # R3: import model classes
 
 # ══════════════════════════════════════════════════════════
 # Interface
@@ -47,6 +55,13 @@ class LibraryRepository(ABC):
 
     @abstractmethod
     def mark_copy_available(self, copy_id): ...
+    # R5: atomic borrow/return operations added to the interface
+    # so every implementation is required to provide them
+    @abstractmethod
+    def borrow_copy(self, member_id, copy_id, borrow_date, due_date): ...
+
+    @abstractmethod
+    def return_copy(self, loan_id, copy_id): ...
 
     # ---- Setup / Lifecycle ----
     @abstractmethod
@@ -152,17 +167,20 @@ class SQLiteRepository(LibraryRepository):
     # ══════════════════════════════════════════════════════
     # Queries
     # ══════════════════════════════════════════════════════
+    # R3: returns Member object instead of a plain dict
+    # so callers use member.status instead of member["status"]
     def find_member(self, member_id):
         c = self.db.cursor()
         c.execute("SELECT id,status FROM members WHERE id=?", (member_id,))
         row = c.fetchone()
-        return {"id": row[0], "status": row[1]} if row else None
-
+        return Member(id=row[0], status=row[1]) if row else None
+    # R3: returns Book object instead of a plain dict
+    # so callers use book.title instead of book["title"]
     def find_book(self, book_id):
         c = self.db.cursor()
         c.execute("SELECT id,title FROM books WHERE id=?", (book_id,))
         row = c.fetchone()
-        return {"id": row[0], "title": row[1]} if row else None
+        return Book(id=row[0], title=row[1]) if row else None
 
     def find_available_copy(self, book_id):
         c = self.db.cursor()
@@ -182,7 +200,8 @@ class SQLiteRepository(LibraryRepository):
             (member_id,)
         )
         return c.fetchone()[0]
-
+    # R3: returns Loan object instead of a plain dict
+    # so callers use loan.due_date and loan.copy_id instead of loan["due_date"]
     def find_active_loan(self, member_id, book_id):
         c = self.db.cursor()
         c.execute(
@@ -194,8 +213,7 @@ class SQLiteRepository(LibraryRepository):
             (member_id, book_id)
         )
         row = c.fetchone()
-        return {"id": row[0], "due_date": row[1], "copy_id": row[2]} if row else None
-
+        return Loan(id=row[0], due_date=row[1], copy_id=row[2]) if row else None
     def search_books(self, text):
         c = self.db.cursor()
         pat = "%" + text + "%"
@@ -212,7 +230,7 @@ class SQLiteRepository(LibraryRepository):
         return c.fetchall()
 
     # ══════════════════════════════════════════════════════
-    # Mutations
+    # Mutations (legacy — kept for compatibility)
     # ══════════════════════════════════════════════════════
     def create_loan(self, member_id, copy_id, borrow_date, due_date):
         c = self.db.cursor()
@@ -244,10 +262,47 @@ class SQLiteRepository(LibraryRepository):
             (copy_id,)
         )
         self.db.commit()
+    # R5: wraps INSERT loan + UPDATE copy status in one transaction.
+    # Phase 2 did these as two separate commits — a crash between them
+    # left the DB inconsistent (loan recorded but copy still AVAILABLE).
+    # Now both succeed together or both roll back together.
+    def borrow_copy(self, member_id, copy_id, borrow_date, due_date):
+        try:
+            c = self.db.cursor()
+            c.execute(
+                """INSERT INTO loans(member_id,copy_id,borrow_date,due_date,returned)
+                   VALUES(?,?,?,?,0)""",
+                (member_id, copy_id, borrow_date, due_date)
+            )
+            loan_id = c.lastrowid
+            c.execute(
+                "UPDATE book_copies SET status='BORROWED' WHERE copy_id=?",
+                (copy_id,)
+            )
+            self.db.commit()
+            return loan_id
+        except Exception:
+            self.db.rollback()
+            raise
+
+    # R5: wraps UPDATE loan returned + UPDATE copy status in one transaction.
+    # Same risk as borrow — a crash between the two writes left a loan
+    # closed but the copy still marked BORROWED (or vice versa).
+    def return_copy(self, loan_id, copy_id):
+        try:
+            c = self.db.cursor()
+            c.execute("UPDATE loans SET returned=1 WHERE id=?", (loan_id,))
+            c.execute(
+                "UPDATE book_copies SET status='AVAILABLE' WHERE copy_id=?",
+                (copy_id,)
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def close(self):
         self.db.close()
-
 
 # ══════════════════════════════════════════════════════════
 # PostgreSQL Implementation
@@ -314,18 +369,18 @@ class PostgresRepository(LibraryRepository):
                 "INSERT INTO book_copies(book_id,status) VALUES(%s, 'AVAILABLE')",
                 (book_id,)
             )
-
+    # R3: returns Member object instead of a plain dict
     def find_member(self, member_id):
         c = self.db.cursor()
         c.execute("SELECT id,status FROM members WHERE id=%s", (member_id,))
         row = c.fetchone()
-        return {"id": row[0], "status": row[1]} if row else None
-
+        return Member(id=row[0], status=row[1]) if row else None
+    # R3: returns Book object instead of a plain dict
     def find_book(self, book_id):
         c = self.db.cursor()
         c.execute("SELECT id,title FROM books WHERE id=%s", (book_id,))
         row = c.fetchone()
-        return {"id": row[0], "title": row[1]} if row else None
+        return Book(id=row[0], title=row[1]) if row else None
 
     def find_available_copy(self, book_id):
         c = self.db.cursor()
@@ -345,7 +400,7 @@ class PostgresRepository(LibraryRepository):
             (member_id,)
         )
         return c.fetchone()[0]
-
+    # R3: returns Loan object instead of a plain dict
     def find_active_loan(self, member_id, book_id):
         c = self.db.cursor()
         c.execute(
@@ -357,7 +412,7 @@ class PostgresRepository(LibraryRepository):
             (member_id, book_id)
         )
         row = c.fetchone()
-        return {"id": row[0], "due_date": row[1], "copy_id": row[2]} if row else None
+        return Loan(id=row[0], due_date=row[1], copy_id=row[2]) if row else None
 
     def search_books(self, text):
         c = self.db.cursor()
@@ -373,7 +428,7 @@ class PostgresRepository(LibraryRepository):
             (pat, pat)
         )
         return c.fetchall()
-
+    # legacy mutations — kept for compatibility
     def create_loan(self, member_id, copy_id, borrow_date, due_date):
         c = self.db.cursor()
         c.execute(
@@ -399,11 +454,43 @@ class PostgresRepository(LibraryRepository):
         c = self.db.cursor()
         c.execute("UPDATE book_copies SET status='AVAILABLE' WHERE copy_id=%s", (copy_id,))
         self.db.commit()
+    # R5: same atomic guarantee as SQLiteRepository.borrow_copy
+    # uses %s placeholders (psycopg2 style) instead of ? (sqlite3 style)
+    def borrow_copy(self, member_id, copy_id, borrow_date, due_date):
+        try:
+            c = self.db.cursor()
+            c.execute(
+                """INSERT INTO loans(member_id,copy_id,borrow_date,due_date,returned)
+                   VALUES(%s,%s,%s,%s,0) RETURNING id""",
+                (member_id, copy_id, borrow_date, due_date)
+            )
+            loan_id = c.fetchone()[0]
+            c.execute(
+                "UPDATE book_copies SET status='BORROWED' WHERE copy_id=%s",
+                (copy_id,)
+            )
+            self.db.commit()
+            return loan_id
+        except Exception:
+            self.db.rollback()
+            raise
+
+    # R5: same atomic guarantee as SQLiteRepository.return_copy
+    def return_copy(self, loan_id, copy_id):
+        try:
+            c = self.db.cursor()
+            c.execute("UPDATE loans SET returned=1 WHERE id=%s", (loan_id,))
+            c.execute(
+                "UPDATE book_copies SET status='AVAILABLE' WHERE copy_id=%s",
+                (copy_id,)
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
 
     def close(self):
         self.db.close()
-
-
 # ══════════════════════════════════════════════════════════
 # Factory
 # ══════════════════════════════════════════════════════════
